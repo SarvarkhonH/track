@@ -1,11 +1,13 @@
-// TrackingScreen.optimized.jsx
+// TrackingScreen with Background Support
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Location from "expo-location";
 import * as Network from "expo-network";
+import * as TaskManager from "expo-task-manager";
 import { useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, Button, StyleSheet, Text, View } from "react-native";
+import { Alert, Button, StyleSheet, Text, View, Platform } from "react-native";
 import { BATCH_LOCATIONS, LOCATIONS } from "../../constants/api";
+import { BACKGROUND_LOCATION_TASK } from "../../services/backgroundLocationTask";
 
 // Simple UUID v4 generator
 function generateUUID() {
@@ -16,23 +18,21 @@ function generateUUID() {
   });
 }
 
-
 /* =========================
    CONFIG
    ========================= */
 const STORAGE_KEY = "offline_locations_v2";
 const DEAD_KEY = "dead_locations_v2";
-const PERSIST_INTERVAL_MS = 5000;     // persist in-memory queue to storage every 5s
-const FLUSH_INTERVAL_MS = 10_000;     // try flushing every 10s (if online)
-const BATCH_SIZE = 25;                // send up to 25 items per batch
-const MAX_QUEUE = 2000;               // cap to avoid uncontrolled growth
-const MAX_BATCH_RETRY = 4;            // per batch
+const PERSIST_INTERVAL_MS = 5000;
+const FLUSH_INTERVAL_MS = 10_000;
+const BATCH_SIZE = 25;
+const MAX_QUEUE = 2000;
+const MAX_BATCH_RETRY = 4;
 const BASE_BACKOFF_MS = 1000;
 
 /* =========================
    UTILS
    ========================= */
-// safe parse
 const safeParse = (s) => {
   try { return JSON.parse(s || "[]"); } catch { return []; }
 };
@@ -41,9 +41,11 @@ async function loadStoredQueue() {
   const raw = await AsyncStorage.getItem(STORAGE_KEY);
   return safeParse(raw);
 }
+
 async function saveStoredQueue(arr) {
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
 }
+
 async function appendDead(item, meta = {}) {
   const raw = await AsyncStorage.getItem(DEAD_KEY);
   const arr = safeParse(raw);
@@ -51,7 +53,6 @@ async function appendDead(item, meta = {}) {
   await AsyncStorage.setItem(DEAD_KEY, JSON.stringify(arr));
 }
 
-// send one with fetch wrapper - throws on non-ok
 async function sendOneToServer(item) {
   const res = await fetch(LOCATIONS, {
     method: "POST",
@@ -61,7 +62,7 @@ async function sendOneToServer(item) {
   if (!res.ok) throw new Error(`status:${res.status}`);
   return res;
 }
-// send batch if backend supports it; must return ok boolean
+
 async function sendBatchToServer(batch) {
   const res = await fetch(BATCH_LOCATIONS, {
     method: "POST",
@@ -79,15 +80,16 @@ export default function TrackingScreenOptimized() {
   const params = useLocalSearchParams();
   const { userId, shtabId, shtabName, userName } = params;
   const [tracking, setTracking] = useState(false);
+  const [backgroundTracking, setBackgroundTracking] = useState(false);
   const [status, setStatus] = useState("Idle");
-  const queueRef = useRef([]);           // in-memory queue of items
+  const queueRef = useRef([]);
   const watcherRef = useRef(null);
   const persistTimerRef = useRef(null);
   const flushTimerRef = useRef(null);
   const isFlushingRef = useRef(false);
   const mountedRef = useRef(true);
 
-  // load persisted queue on mount
+  // Check if background tracking is already running on mount
   useEffect(() => {
     mountedRef.current = true;
     (async () => {
@@ -95,6 +97,13 @@ export default function TrackingScreenOptimized() {
         const existing = await loadStoredQueue();
         queueRef.current = Array.isArray(existing) ? existing : [];
         setStatus((s) => `${s} | queued:${queueRef.current.length}`);
+
+        // Check if background task is already running
+        const isTaskRegistered = await TaskManager.isTaskRegisteredAsync(BACKGROUND_LOCATION_TASK);
+        if (isTaskRegistered) {
+          setBackgroundTracking(true);
+          setStatus("Background tracking active");
+        }
       } catch (_e) {
         console.warn("Load queue error", _e);
       }
@@ -102,11 +111,10 @@ export default function TrackingScreenOptimized() {
     return () => { mountedRef.current = false; };
   }, []);
 
-  // persist queue periodically
+  // Persist queue periodically
   useEffect(() => {
     persistTimerRef.current = setInterval(async () => {
       try {
-        // Persist only if changed length (simple heuristic)
         await saveStoredQueue(queueRef.current);
       } catch (_e) {
         // persist error ignored
@@ -115,22 +123,20 @@ export default function TrackingScreenOptimized() {
     return () => { clearInterval(persistTimerRef.current); };
   }, []);
 
-  // non-blocking enqueue
+  // Non-blocking enqueue
   const enqueue = useCallback(async (item) => {
-    // assign simple client id for idempotency/dedup
     const clientId = item.clientId || generateUUID();
     const obj = { clientId, ...item };
     queueRef.current.push(obj);
-    // cap queue size
+
     if (queueRef.current.length > MAX_QUEUE) {
       queueRef.current.splice(0, queueRef.current.length - MAX_QUEUE);
     }
-    // update UI status
-    setStatus((s) => `Queued:${queueRef.current.length}`);
-    // persist eventually (periodic timer will persist)
+
+    setStatus(`Queued:${queueRef.current.length}`);
   }, []);
 
-  // core flush function (process batches with retries) — DEFINE BEFORE EFFECTS THAT USE IT
+  // Core flush function
   const flushQueue = useCallback(async () => {
     if (isFlushingRef.current) return;
     isFlushingRef.current = true;
@@ -139,14 +145,11 @@ export default function TrackingScreenOptimized() {
       if (!(net.isConnected && net.isInternetReachable)) return;
       if (!queueRef.current.length) return;
 
-      // create a local copy to work with to avoid concurrency issues
       while (queueRef.current.length) {
         const batch = queueRef.current.slice(0, BATCH_SIZE);
-        // try batch send first (fast)
         try {
           await sendBatchToServer(batch);
         } catch (_e) {
-          // batch failed — fallback to per-item send with retry/backoff
           for (let i = 0; i < batch.length; i++) {
             const item = batch[i];
             let ok = false;
@@ -156,24 +159,19 @@ export default function TrackingScreenOptimized() {
                 ok = true;
                 break;
               } catch (_err) {
-                // exponential backoff (await)
                 const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt - 1);
                 await new Promise((r) => setTimeout(r, backoff));
               }
             }
             if (!ok) {
-              // move to dead letter so it doesn't block the queue forever
               await appendDead(item, { reason: "send_failed" });
             }
           }
         } finally {
-          // remove processed length regardless of success/failure to avoid infinite loop
           queueRef.current.splice(0, batch.length);
-          // persist new queue state
           await saveStoredQueue(queueRef.current);
           setStatus(`Queued:${queueRef.current.length}`);
         }
-        // slight delay between batches to prevent hammering
         await new Promise((r) => setTimeout(r, 200));
       }
     } finally {
@@ -181,16 +179,15 @@ export default function TrackingScreenOptimized() {
     }
   }, []);
 
-  // network listener: flush when online
+  // Network listener: flush when online
   useEffect(() => {
     const listener = Network.addNetworkStateListener(async (state) => {
       if (!mountedRef.current) return;
       if (state.isConnected && state.isInternetReachable) {
-        // immediate flush attempt
-        flushQueue().catch(() => { /* retry flush on reconnect */ });
+        flushQueue().catch(() => {});
       }
     });
-    // also periodic flush attempt
+
     flushTimerRef.current = setInterval(() => {
       flushQueue().catch(() => {});
     }, FLUSH_INTERVAL_MS);
@@ -201,7 +198,7 @@ export default function TrackingScreenOptimized() {
     };
   }, [flushQueue]);
 
-  // non-blocking send: push to queue and return immediately
+  // Non-blocking send: push to queue and return immediately
   const enqueueLocation = useCallback(async (latitude, longitude, timestamp, extra = {}) => {
     const item = {
       userId,
@@ -211,14 +208,12 @@ export default function TrackingScreenOptimized() {
       timestamp: timestamp || new Date().toISOString(),
       ...extra,
     };
-    // if online and small queue, try immediate send (fire-and-forget)
+
     const net = await Network.getNetworkStateAsync();
     if (net.isConnected && net.isInternetReachable && queueRef.current.length < 5) {
-      // try optimistic send but do not await in caller
       sendOneToServer(item)
-        .then(() => { /* success */ })
+        .then(() => {})
         .catch(async () => {
-          // fallback to enqueue if send fails
           await enqueue(item);
         });
     } else {
@@ -226,17 +221,17 @@ export default function TrackingScreenOptimized() {
     }
   }, [enqueue, userId, shtabId]);
 
-  // start/stop tracking
+  // Start foreground tracking
   const startTracking = useCallback(async () => {
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted") {
+    const { status: fgStatus } = await Location.requestForegroundPermissionsAsync();
+    if (fgStatus !== "granted") {
       Alert.alert("Permission required", "Location permission is required to track.");
       return;
     }
-    setTracking(true);
-    setStatus("Tracking started");
 
-    // watch position; callback must be non-blocking
+    setTracking(true);
+    setStatus("Foreground tracking started");
+
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.Balanced,
@@ -244,15 +239,14 @@ export default function TrackingScreenOptimized() {
         distanceInterval: 3,
       },
       (loc) => {
-        // non-blocking: enqueue quickly
         enqueueLocation(loc.coords.latitude, loc.coords.longitude, loc.timestamp);
-        // optional UI update:
-        setStatus((s) => `Queued:${queueRef.current.length}`);
+        setStatus(`Queued:${queueRef.current.length}`);
       }
     );
     watcherRef.current = sub;
   }, [enqueueLocation]);
 
+  // Stop foreground tracking
   const stopTracking = useCallback(async () => {
     setTracking(false);
     setStatus("Stopping...");
@@ -260,13 +254,84 @@ export default function TrackingScreenOptimized() {
       watcherRef.current.remove();
       watcherRef.current = null;
     }
-    // final persist and try flush once
+
     await saveStoredQueue(queueRef.current);
     await flushQueue().catch(() => {});
     setStatus(`Stopped | queued:${queueRef.current.length}`);
   }, [flushQueue]);
 
-  // cleanup on unmount
+  // Start background tracking
+  const startBackgroundTracking = useCallback(async () => {
+    try {
+      // Request foreground permission first
+      const { status: fgStatus } = await Location.requestForegroundPermissionsAsync();
+      if (fgStatus !== "granted") {
+        Alert.alert("Permission required", "Location permission is required.");
+        return;
+      }
+
+      // Request background permission (Android 10+)
+      if (Platform.OS === 'android' && Platform.Version >= 29) {
+        const { status: bgStatus } = await Location.requestBackgroundPermissionsAsync();
+        if (bgStatus !== "granted") {
+          Alert.alert(
+            "Background Permission Required",
+            "Please allow 'All the time' location access for background tracking."
+          );
+          return;
+        }
+      }
+
+      // Store tracking metadata
+      await AsyncStorage.setItem('tracking_metadata', JSON.stringify({
+        userId,
+        shtabId,
+        shtabName,
+        userName,
+      }));
+
+      // Start background location updates
+      await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
+        accuracy: Location.Accuracy.Balanced,
+        timeInterval: 5000, // 5 seconds
+        distanceInterval: 10, // 10 meters
+        foregroundService: {
+          notificationTitle: "Geo Tracker Active",
+          notificationBody: `Tracking for ${shtabName}`,
+          notificationColor: "#007AFF",
+        },
+        pausesUpdatesAutomatically: false,
+        showsBackgroundLocationIndicator: true,
+      });
+
+      setBackgroundTracking(true);
+      setStatus("Background tracking started");
+      Alert.alert("Success", "Background tracking is now active. The app will track your location even when closed.");
+    } catch (error) {
+      console.error("Error starting background tracking:", error);
+      Alert.alert("Error", `Failed to start background tracking: ${error.message}`);
+    }
+  }, [userId, shtabId, shtabName, userName]);
+
+  // Stop background tracking
+  const stopBackgroundTracking = useCallback(async () => {
+    try {
+      const isTaskRegistered = await TaskManager.isTaskRegisteredAsync(BACKGROUND_LOCATION_TASK);
+      if (isTaskRegistered) {
+        await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+      }
+
+      await AsyncStorage.removeItem('tracking_metadata');
+      setBackgroundTracking(false);
+      setStatus("Background tracking stopped");
+      Alert.alert("Success", "Background tracking has been stopped.");
+    } catch (error) {
+      console.error("Error stopping background tracking:", error);
+      Alert.alert("Error", `Failed to stop background tracking: ${error.message}`);
+    }
+  }, []);
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (watcherRef.current) watcherRef.current.remove();
@@ -277,26 +342,54 @@ export default function TrackingScreenOptimized() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Tracking (Optimized)</Text>
-      
-      {/* Display params */}
+      <Text style={styles.title}>Tracking (with Background)</Text>
+
       <Text style={styles.paramText}>Shtab: {shtabName || "—"} ({shtabId || "—"})</Text>
       <Text style={styles.paramText}>User: {userName || "—"} ({userId || "—"})</Text>
-      
+
       <Text style={styles.text}>{status}</Text>
       <Text style={styles.note}>Local queue: {queueRef.current.length}</Text>
 
-      {!tracking ? (
-        <Button title="Start Tracking" onPress={startTracking} />
-      ) : (
-        <Button title="Stop Tracking" onPress={stopTracking} color="red" />
-      )}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Foreground Tracking</Text>
+        {!tracking ? (
+          <Button title="Start Foreground Tracking" onPress={startTracking} />
+        ) : (
+          <Button title="Stop Foreground Tracking" onPress={stopTracking} color="red" />
+        )}
+      </View>
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Background Tracking</Text>
+        <Text style={styles.helperText}>
+          Tracks location even when app is closed or in background
+        </Text>
+        {!backgroundTracking ? (
+          <Button
+            title="Start Background Tracking"
+            onPress={startBackgroundTracking}
+            color="#28a745"
+          />
+        ) : (
+          <Button
+            title="Stop Background Tracking"
+            onPress={stopBackgroundTracking}
+            color="red"
+          />
+        )}
+      </View>
 
       <View style={{ height: 12 }} />
 
-      <Button title="Flush Now" onPress={() => flushQueue().catch(() => {})} />
+      <Button title="Flush Queue Now" onPress={() => flushQueue().catch(() => {})} />
       <View style={{ height: 6 }} />
-      <Button title="Clear Dead" onPress={async () => { await AsyncStorage.removeItem(DEAD_KEY); Alert.alert("Dead queue cleared"); }} />
+      <Button
+        title="Clear Dead Queue"
+        onPress={async () => {
+          await AsyncStorage.removeItem(DEAD_KEY);
+          Alert.alert("Success", "Dead queue cleared");
+        }}
+      />
     </View>
   );
 }
@@ -305,9 +398,48 @@ export default function TrackingScreenOptimized() {
    STYLES
    ========================= */
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 18, backgroundColor: "#0b0b0b", justifyContent: "center" },
-  title: { fontSize: 20, color: "#fff", fontWeight: "700", marginBottom: 6 },
-  paramText: { color: "#6366f1", marginBottom: 4, fontSize: 14 },
-  text: { color: "#ddd", marginBottom: 8 },
-  note: { color: "#9ca3af", marginBottom: 12 }
+  container: {
+    flex: 1,
+    padding: 18,
+    backgroundColor: "#0b0b0b",
+    justifyContent: "center"
+  },
+  title: {
+    fontSize: 20,
+    color: "#fff",
+    fontWeight: "700",
+    marginBottom: 6
+  },
+  paramText: {
+    color: "#6366f1",
+    marginBottom: 4,
+    fontSize: 14
+  },
+  text: {
+    color: "#ddd",
+    marginBottom: 8
+  },
+  note: {
+    color: "#9ca3af",
+    marginBottom: 20
+  },
+  section: {
+    marginBottom: 20,
+    padding: 12,
+    backgroundColor: "#1a1a1a",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#333",
+  },
+  sectionTitle: {
+    fontSize: 16,
+    color: "#fff",
+    fontWeight: "600",
+    marginBottom: 8,
+  },
+  helperText: {
+    fontSize: 12,
+    color: "#888",
+    marginBottom: 12,
+  },
 });

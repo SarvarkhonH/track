@@ -3,6 +3,8 @@ import { useEffect } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 
 import { AuthProvider, useAuth } from "../hooks/useAuth";
+// Import background location task to register it
+import "../services/backgroundLocationTask";
 
 export default function RootLayout() {
   return (
