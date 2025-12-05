@@ -33,6 +33,11 @@ export default function LoginScreen() {
         body: JSON.stringify({ phoneNumber: phone.trim(), password: password.trim() }),
       });
 
+      if(!response.ok){
+        throw new Error(
+          ''
+        )
+      }
       const data = await response.json();
       if (response.ok && data.token && (data.user?.id || data.user?._id)) {
         const userId = data.user?.id || data.user?._id;

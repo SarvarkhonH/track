@@ -1,7 +1,7 @@
 // Simple API constants — concrete local endpoints for development (localhost:3000)
 // Named exports are simple strings (or functions for dynamic routes).
 
-export const API_BASE = 'http://localhost:3000/api';
+export const API_BASE = 'http://192.168.100.152:3000';
 
 export const LOGIN = `${API_BASE}/v1/users/login`;
 export const USERS = `${API_BASE}/v1/users`;
