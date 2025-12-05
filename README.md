@@ -1,4 +1,6 @@
-# Welcome to your Expo app 👋
+# Geo Tracker Android
+
+Geo Tracker is a React Native application for real-time location tracking with offline support. 
 
 This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
 
@@ -34,6 +36,17 @@ npm run reset-project
 ```
 
 This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+
+## API Configuration
+
+The app's API endpoints are configured in `constants/api.js`.
+
+- Default local backend: `http://localhost:3000/api`
+- Production backend: `https://tracking-api-1-hv18.onrender.com/api`
+
+Set `API_MODE` inside `constants/api.js` to `"local"` or `"global"` depending on which server you want the app to call.
+
+To test the app end-to-end, start your local backend (see `server/README.md`) and then run the app with Expo.
 
 ## Learn more
 
